@@ -1,0 +1,843 @@
+最好的做法不是一上来照着整个仓库抄，而是按 **“先最小可运行，再逐步加能力”** 的顺序手撕。
+你现在已经懂了不少理论，所以接下来最重要的是：
+
+> **按依赖关系复现，而不是按目录顺序复现。**
+
+因为目录里有些东西是“核心模型”，有些是“训练脚本”，有些是“部署/推理接口”。
+真正适合手撕的顺序，应该是：
+
+**最小模型前向 → 训练闭环 → 推理闭环 → 性能优化 → 参数高效训练 → 对齐训练**
+
+---
+
+# 一、先给你结论：最推荐的手撕顺序
+
+我建议你按下面 8 个阶段来。
+
+## Phase 0：先只看，不写 trainer
+
+先只盯这几个文件：
+
+* `model/model_minimind.py`
+* `model/__init__.py`
+* `model/tokenizer.json`
+* `model/tokenizer_config.json`
+
+先别碰：
+
+* `trainer/train_dpo.py`
+* `trainer/train_ppo.py`
+* `trainer/train_grpo.py`
+* `scripts/*.py`
+
+因为这些都建立在“你已经把 base model 跑通”之上。
+
+---
+
+## Phase 1：手撕最小版 Decoder-Only 骨架
+
+目标是先自己写出一个 **能前向跑通的最小 GPT/LLaMA 风格模型**。
+
+建议你先只实现这些模块：
+
+1. `MiniMindConfig`
+2. `RMSNorm`
+3. `RoPE`
+4. `SelfAttention`
+5. `FeedForward`
+6. `MiniMindBlock`
+7. `MiniMindModel`
+8. `MiniMindForCausalLM`
+
+这一阶段先不要加：
+
+* KV Cache
+* GQA/MQA
+* MoE
+* LoRA
+* Flash Attention
+* 训练器
+
+---
+
+## Phase 2：让最小模型能训练一个 batch
+
+目标是：
+
+* 输入 `input_ids`
+* 输出 `logits`
+* 给 `labels`
+* 算 `cross_entropy`
+* `loss.backward()` 不报错
+
+这一步一通，你的“模型主干”才算真的懂了。
+
+---
+
+## Phase 3：补上推理闭环
+
+目标是支持：
+
+* `model(input_ids)` 得到 logits
+* greedy decode / sampling
+* 单轮生成
+* 多步自回归生成
+
+这时先不用 KV Cache，哪怕每次都全量重算，也可以。
+
+---
+
+## Phase 4：补 KV Cache
+
+目标是把“能生成”升级为“高效生成”。
+
+这一阶段重点实现：
+
+* `past_key_values`
+* prefill / decode 两阶段
+* 单步生成时只输入最后一个 token
+
+---
+
+## Phase 5：补 GQA / MoE / 其他架构增强
+
+如果 `MiniMind` 里有这些，再逐个补：
+
+* `num_kv_heads != num_attention_heads`
+* `repeat_kv`
+* `MOEFeedForward`
+* `aux_loss`
+
+这一阶段属于“结构增强版”。
+
+---
+
+## Phase 6：补 LoRA
+
+去看：
+
+* `model/model_lora.py`
+* `trainer/train_lora.py`
+
+LoRA 很适合在你 base model 跑通后再加，因为它本质上是：
+
+> 在已有 Linear 上外挂低秩增量参数
+
+不是模型最核心的第一步。
+
+---
+
+## Phase 7：补预训练 / SFT
+
+去看：
+
+* `trainer/train_pretrain.py`
+* `trainer/train_full_sft.py`
+* `trainer/trainer_utils.py`
+
+这时你就不是在“手撕模型”，而是在“手撕训练范式”。
+
+---
+
+## Phase 8：最后看 DPO / PPO / GRPO
+
+最后再看：
+
+* `trainer/train_dpo.py`
+* `trainer/train_ppo.py`
+* `trainer/train_grpo.py`
+* `trainer/rollout_engine.py`
+* `trainer/train_agent.py`
+
+因为这些不是“基础模型代码”，而是“在模型之上的训练算法系统”。
+
+---
+
+# 二、为什么这是最好的顺序
+
+因为依赖关系就是这样：
+
+## 1. `train_dpo.py / train_ppo.py / train_grpo.py`
+
+依赖于你已经懂：
+
+* CausalLM forward
+* logprob 怎么算
+* generate 怎么走
+* labels/shift 怎么做
+* cache 怎么工作
+
+如果你 base model 还没手撕通，就直接看这些，会非常乱。
+
+---
+
+## 2. `scripts/*.py`
+
+这些更偏工程调用层：
+
+* `chat_api.py`
+* `serve_openai_api.py`
+* `web_demo.py`
+
+它们不是模型本体，而是“怎么把模型拿出来用”。
+
+不适合作为手撕入口。
+
+---
+
+## 3. `model_lora.py`
+
+它依赖于你先懂原始 `Linear`、attention、FFN 的参数结构。
+否则你连 LoRA 挂载在哪都不清楚。
+
+---
+
+# 三、结合你这个目录，最合理的“阅读 / 复现”顺序
+
+下面我按你这个仓库目录，给一个更具体的顺序。
+
+---
+
+## 第一步：只盯 `model/model_minimind.py`
+
+这是你最该先手撕的文件。
+
+你的任务不是一口气全部抄完，而是拆成下面这些小模块逐个写。
+
+### 建议拆分为：
+
+1. `MiniMindConfig`
+2. `RMSNorm`
+3. `precompute_freqs_cis` / `apply_rotary_emb`
+4. `Attention`
+5. `FeedForward`
+6. `MiniMindBlock`
+7. `MiniMindModel`
+8. `MiniMindForCausalLM`
+
+---
+
+## 第二步：自己新建一个极简项目，不要直接在原仓库里改
+
+建议你自己建一个复现仓库，比如：
+
+```text
+minimind-from-scratch/
+├─ docs/
+├─ src/
+│  ├─ config.py
+│  ├─ rmsnorm.py
+│  ├─ rope.py
+│  ├─ attention.py
+│  ├─ ffn.py
+│  ├─ block.py
+│  ├─ model.py
+│  ├─ generation.py
+│  └─ utils.py
+├─ tests/
+│  ├─ test_shapes.py
+│  ├─ test_forward.py
+│  └─ test_generate.py
+└─ train/
+   ├─ train_tiny_pretrain.py
+   └─ train_tiny_sft.py
+```
+
+不要一开始就按原仓库的复杂工程结构复刻。
+因为你现在目标是“手撕理解”，不是“1:1 工程克隆”。
+
+---
+
+# 四、最推荐的手撕阶段拆分
+
+下面这个是我最推荐你的实际执行顺序。
+
+---
+
+## Stage 1：先手撕 `MiniMindConfig`
+
+先写一个最小配置类，先只留最关键参数：
+
+* `vocab_size`
+* `hidden_size`
+* `num_hidden_layers`
+* `num_attention_heads`
+* `num_kv_heads`
+* `intermediate_size`
+* `max_position_embeddings`
+* `dropout`
+* `rms_norm_eps`
+* `rope_theta`
+
+先别管一堆高级参数。
+
+### 这一阶段你要弄懂
+
+* 哪些维度必须整除
+* `head_dim = hidden_size // num_attention_heads`
+* `num_kv_heads` 和 `num_attention_heads` 的关系
+
+---
+
+## Stage 2：手撕 `RMSNorm`
+
+这个很适合作为第一个独立模块。
+
+### 你要做的事
+
+* 自己写 forward
+* 和 `nn.LayerNorm` 的差异对比
+* 检查输入输出 shape 不变
+
+### 验证标准
+
+输入 `[B,S,H]`，输出仍是 `[B,S,H]`。
+
+---
+
+## Stage 3：手撕 `RoPE`
+
+把这几个点单独吃透：
+
+* `precompute_freqs_cis`
+* `cos/sin` 表的 shape
+* `apply_rotary_emb`
+* 为什么作用在 `Q/K` 而不是 embedding 上
+
+### 验证标准
+
+给一个随机 `Q/K`，应用 RoPE 前后 shape 不变。
+
+---
+
+## Stage 4：手撕最小 Self-Attention
+
+这一步先写最基础版：
+
+* 输入 `[B,S,H]`
+* 线性投影成 `Q/K/V`
+* reshape 成多头
+* 做 mask attention
+* 拼回 `[B,S,H]`
+
+### 这一步先不要加
+
+* KV Cache
+* GQA
+* Flash Attention
+
+### 先只实现
+
+最朴素的 scaled dot-product attention。
+
+### 验证标准
+
+* shape 全部对
+* causal mask 正确
+* 不报维度错误
+
+---
+
+## Stage 5：手撕最小 FeedForward
+
+先写普通 FFN / SwiGLU。
+
+如果 `MiniMind` 用的是 SwiGLU，就直接按那个写：
+
+* `gate_proj`
+* `up_proj`
+* `down_proj`
+
+### 验证标准
+
+输入 `[B,S,H]`，输出 `[B,S,H]`
+
+---
+
+## Stage 6：手撕 `MiniMindBlock`
+
+把：
+
+* norm
+* attention
+* residual
+* norm
+* mlp
+* residual
+
+串起来。
+
+### 你要彻底弄懂
+
+* Pre-Norm 结构
+* 残差连接的顺序
+* block 内每一步 shape
+
+---
+
+## Stage 7：手撕 `MiniMindModel`
+
+把：
+
+* `embed_tokens`
+* `layers`
+* `final norm`
+* `RoPE buffers`
+
+全部拼起来。
+
+### 先只做
+
+* 不带 cache 的前向
+* 不带 MoE 的前向
+
+### 验证标准
+
+输入 `[B,S]`，输出 `[B,S,H]`
+
+---
+
+## Stage 8：手撕 `MiniMindForCausalLM`
+
+加上：
+
+* `lm_head`
+* weight tying
+* shift loss
+
+### 这一阶段你要弄懂
+
+* 为什么 `labels` 是 `[B,S]`
+* 为什么要 `shift_logits[..., :-1, :]`
+* 为什么要 `shift_labels[..., 1:]`
+
+### 验证标准
+
+* 输出 `logits.shape = [B,S,V]`
+* 能算出 CE loss
+* 能 backward
+
+---
+
+# 五、到这里为止，你就已经“手撕完最小版 MiniMind 主干”了
+
+注意，这个阶段非常关键。
+
+很多人一上来就去看：
+
+* LoRA
+* PPO
+* DPO
+* API
+* Web demo
+
+结果基础没有真正打通。
+
+你现在最该做的是：
+
+> **先把 `model_minimind.py` 的最小闭环手撕完，并且每个张量 shape 都能自己说清楚。**
+
+---
+
+# 六、然后怎么往上加
+
+---
+
+## Stage 9：补生成逻辑（先不加 cache）
+
+你可以自己写一个简易 `generate()`：
+
+* 每次前向
+* 取最后一个位置 logits
+* greedy 或 temperature sampling
+* append 到输入
+* 继续循环
+
+### 验证标准
+
+能从随机模型输出 token 序列。
+
+---
+
+## Stage 10：补 KV Cache
+
+这时回到你刚刚已经理解过的内容：
+
+* `past_key_values`
+* prefill
+* decode
+* `start_pos`
+* 位置切片
+
+### 建议步骤
+
+1. 先在 attention 里支持 `past_key_value=None`
+2. 再支持 `(past_k, past_v)`
+3. 再实现拼接
+4. 再把 cache 从 block 往 model 顶层返回
+
+### 验证标准
+
+* 不开 cache 和开 cache 生成结果一致
+* 开 cache 更快
+
+---
+
+## Stage 11：补 GQA / MQA
+
+如果原模型用了 `num_kv_heads < num_attention_heads`，这时再补：
+
+* `repeat_kv`
+* query heads 和 kv heads 的区别
+
+### 为什么不先做这个
+
+因为它是 Attention 的增强版，不是最小版必要条件。
+
+---
+
+## Stage 12：补 MoE
+
+如果 `model_minimind.py` 里有 `MOEFeedForward`，建议这时再上。
+
+### 你要分两步
+
+1. 先看普通 FFN 怎么被替换
+2. 再看 router、top-k、expert dispatch、aux_loss
+
+### 为什么不建议一开始就上
+
+因为 MoE 会把“一个 token 走一个 MLP”的简单图，变成“token 到 expert 的动态路由”，复杂度一下子上去。
+
+---
+
+## Stage 13：补 `model_lora.py`
+
+这时再去看 LoRA 非常合适。
+
+### 推荐理解顺序
+
+1. 先复习线性层：`y = xW^T`
+2. 再理解 LoRA：`W + BA`
+3. 看 LoRA 是挂到哪些层：
+
+   * `q_proj`
+   * `k_proj`
+   * `v_proj`
+   * `o_proj`
+   * `up/down/gate proj`
+
+### 为什么这时看最好
+
+因为你已经清楚模型里每个 Linear 在哪里。
+
+---
+
+# 七、trainer 目录应该怎么手撕
+
+你的 `trainer/` 目录里这些文件，不建议按文件名一个个平推。
+最好的顺序是按训练复杂度来。
+
+---
+
+## 先看 1：`trainer/train_pretrain.py`
+
+这是最基础训练脚本。
+
+你要看的是：
+
+* dataset 怎么构造
+* `input_ids/labels` 怎么来
+* optimizer 怎么写
+* 一个训练 step 怎么跑
+
+这是最适合你在 base model 后第一个看的 trainer。
+
+---
+
+## 再看 2：`trainer/train_full_sft.py`
+
+在 pretrain 基础上，理解：
+
+* prompt-response 数据
+* label mask
+* chat template
+* 只监督 assistant 输出
+
+---
+
+## 再看 3：`trainer/train_lora.py`
+
+因为 LoRA 训练是你前面已懂的模型外挂低秩层。
+
+你重点看：
+
+* 哪些参数 `requires_grad=True`
+* 哪些被冻结
+* optimizer 只优化 LoRA 参数
+
+---
+
+## 再看 4：`trainer/train_distillation.py`
+
+蒸馏比 SFT 更进一步，但仍属于“监督式训练”的延伸。
+
+---
+
+## 最后才看：
+
+* `train_dpo.py`
+* `train_ppo.py`
+* `train_grpo.py`
+* `rollout_engine.py`
+* `train_agent.py`
+
+因为这些属于“对齐 / 强化学习 / 代理训练”层。
+
+如果你没先把：
+
+* logprob
+* generate
+* sampling
+* reward / policy / ref model
+  这些概念接上，会非常绕。
+
+---
+
+# 八、scripts 目录什么时候看
+
+`scripts/` 建议最后看。
+
+比如：
+
+* `chat_api.py`
+* `serve_openai_api.py`
+* `web_demo.py`
+
+这些适合在你已经把模型和训练都理解之后，作为“部署和调用”层再看。
+
+否则容易陷进各种工程细节里：
+
+* API 输入输出格式
+* 服务启动
+* 推理包装
+* 前后端交互
+
+这些对“手撕模型核心”帮助不大。
+
+---
+
+# 九、我建议你的具体 Git 提交阶段
+
+你之前就有“想做成自己的项目”的想法，这里正好可以直接转成一套很好的仓库提交节奏。
+
+---
+
+## 第 1 次提交
+
+`init project structure`
+
+内容：
+
+* 建仓库
+* `README`
+* `docs/roadmap.md`
+* 基本目录
+
+---
+
+## 第 2 次提交
+
+`implement minimind config and rmsnorm`
+
+内容：
+
+* `MiniMindConfig`
+* `RMSNorm`
+
+---
+
+## 第 3 次提交
+
+`implement rotary positional embedding`
+
+内容：
+
+* `precompute_freqs_cis`
+* `apply_rotary_emb`
+
+---
+
+## 第 4 次提交
+
+`implement causal self-attention without cache`
+
+内容：
+
+* 最小 self-attention
+* causal mask
+
+---
+
+## 第 5 次提交
+
+`implement swiglu feedforward and transformer block`
+
+内容：
+
+* FFN
+* Block
+
+---
+
+## 第 6 次提交
+
+`implement decoder backbone and causal lm head`
+
+内容：
+
+* `MiniMindModel`
+* `MiniMindForCausalLM`
+* CE loss
+
+---
+
+## 第 7 次提交
+
+`add autoregressive generation`
+
+内容：
+
+* greedy decode
+* sampling
+
+---
+
+## 第 8 次提交
+
+`add kv cache for incremental decoding`
+
+内容：
+
+* `past_key_values`
+* prefill/decode
+
+---
+
+## 第 9 次提交
+
+`add grouped query attention support`
+
+内容：
+
+* `num_kv_heads`
+* `repeat_kv`
+
+---
+
+## 第 10 次提交
+
+`add mixture-of-experts feedforward`
+
+内容：
+
+* router
+* top-k
+* experts
+* aux_loss
+
+---
+
+## 第 11 次提交
+
+`add lora adaptation`
+
+内容：
+
+* LoRA linear
+* parameter freezing
+
+---
+
+## 第 12 次提交
+
+`add tiny pretrain and sft training scripts`
+
+内容：
+
+* 最小训练闭环
+
+---
+
+## 第 13 次提交
+
+`analyze dpo and ppo training pipeline`
+
+内容：
+
+* 开始接对齐训练
+
+---
+
+# 十、最适合你的学习策略：三层并行
+
+你现在已经有一定理论基础，我建议你每个阶段都同时做三件事：
+
+## 1. 手写最小实现
+
+不要直接复制原仓库。
+
+## 2. 对照原仓库验证
+
+看自己和 `model_minimind.py` 差在哪。
+
+## 3. 画 shape 流图
+
+把每个模块输入输出 shape 写出来。
+
+这三个同时做，理解最快。
+
+---
+
+# 十一、你当前最应该先复现哪个文件
+
+直接给结论：
+
+> **第一优先级：`model/model_minimind.py`**
+
+而且不是一次性全抄，而是按下面顺序切开：
+
+1. `Config`
+2. `RMSNorm`
+3. `RoPE`
+4. `Attention`
+5. `FFN`
+6. `Block`
+7. `Model`
+8. `CausalLM`
+
+---
+
+# 十二、你现在最不该先碰的文件
+
+现阶段最不建议一上来碰的是：
+
+* `trainer/train_ppo.py`
+* `trainer/train_grpo.py`
+* `trainer/train_agent.py`
+* `scripts/serve_openai_api.py`
+* `scripts/web_demo.py`
+
+因为这些都不是“模型底层”。
+
+---
+
+# 十三、给你的最终执行版本
+
+如果你现在就开始，我建议你的实际顺序就一句话：
+
+> **先从 `model_minimind.py` 中拆出最小版 LLaMA 风格 Decoder-only 模型，跑通 forward + loss + generate；再补 KV Cache；再补 GQA/MoE；最后才去看 LoRA、Pretrain/SFT、DPO/PPO/GRPO。**
+
+---
+
+如果你愿意，我下一条可以直接给你一份 **“7 天手撕 MiniMind 计划表”**，具体到每天该看哪个文件、写哪个模块、做什么测试。

@@ -1,0 +1,57 @@
+﻿# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+.env
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Training outputs
+checkpoints/
+out/
+runs/
+wandb/
+logs/
+tensorboard/
+
+# Model weights
+*.pt
+*.pth
+*.bin
+*.ckpt
+*.safetensors
+
+# Large datasets
+*.arrow
+*.parquet
+*.npy
+*.npz
+
+# Logs
+*.log
+
+# Temporary files
+tmp/
+temp/
+cache/
+
+dataset/
+
+.env
+
+.env.*
+
+.env
+
+.env.*

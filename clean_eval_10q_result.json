@@ -1,0 +1,112 @@
+[
+  {
+    "qid": 1,
+    "category": "自我介绍",
+    "prompt": "请用两三句话介绍一下你自己。",
+    "answer": "我是一个中文助手模型，可以帮助你回答问题、写代码和整理信息。",
+    "readability": 1,
+    "relevance": 1,
+    "completeness": 1,
+    "note": "回答简洁，身份表述正常",
+    "total": 3
+  },
+  {
+    "qid": 2,
+    "category": "定义解释",
+    "prompt": "请简单解释什么是机器学习。",
+    "answer": "机器学习是让模型从数据中学习规律，并用这些规律做预测或分类的方法。",
+    "readability": 1,
+    "relevance": 1,
+    "completeness": 1,
+    "note": "定义基本正确",
+    "total": 3
+  },
+  {
+    "qid": 3,
+    "category": "常识问答",
+    "prompt": "为什么天空是蓝色的？",
+    "answer": "",
+    "readability": null,
+    "relevance": null,
+    "completeness": null,
+    "note": "",
+    "total": null
+  },
+  {
+    "qid": 4,
+    "category": "常识问答",
+    "prompt": "请解释一下光合作用的基本过程。",
+    "answer": "",
+    "readability": null,
+    "relevance": null,
+    "completeness": null,
+    "note": "",
+    "total": null
+  },
+  {
+    "qid": 5,
+    "category": "生活建议",
+    "prompt": "明天下雨出门需要注意什么？",
+    "answer": "",
+    "readability": null,
+    "relevance": null,
+    "completeness": null,
+    "note": "",
+    "total": null
+  },
+  {
+    "qid": 6,
+    "category": "模型知识",
+    "prompt": "请用三句话介绍 Transformer。",
+    "answer": "",
+    "readability": null,
+    "relevance": null,
+    "completeness": null,
+    "note": "",
+    "total": null
+  },
+  {
+    "qid": 7,
+    "category": "定义解释",
+    "prompt": "什么是监督学习？请简单说明。",
+    "answer": "",
+    "readability": null,
+    "relevance": null,
+    "completeness": null,
+    "note": "",
+    "total": null
+  },
+  {
+    "qid": 8,
+    "category": "代码生成",
+    "prompt": "请用 Python 写一个计算斐波那契数列的函数。",
+    "answer": "",
+    "readability": null,
+    "relevance": null,
+    "completeness": null,
+    "note": "",
+    "total": null
+  },
+  {
+    "qid": 9,
+    "category": "代码生成",
+    "prompt": "请写一个 Python 函数，判断一个数是不是质数。",
+    "answer": "",
+    "readability": null,
+    "relevance": null,
+    "completeness": null,
+    "note": "",
+    "total": null
+  },
+  {
+    "qid": 10,
+    "category": "推荐生成",
+    "prompt": "请推荐几种中国美食，并简单说明特点。",
+    "answer": "",
+    "readability": null,
+    "relevance": null,
+    "completeness": null,
+    "note": "",
+    "total": null
+  }
+]
