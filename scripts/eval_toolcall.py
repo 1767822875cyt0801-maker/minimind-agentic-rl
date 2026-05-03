@@ -15,7 +15,17 @@ from models.model_minimind import MiniMindConfig, MiniMindForCausalLM
 from trainer.trainer_utils import setup_seed, get_model_params
 warnings.filterwarnings('ignore')
 
+#5.3 加一个清洗函数
 ANSI_ESCAPE_RE = re.compile(r'\x1b\[[0-?]*[ -/]*[@-~]')
+
+def clean_terminal_text(s):
+    if not isinstance(s, str):
+        return s
+    # 删除方向键、控制键等 ANSI escape sequence，例如 \x1b[D
+    s = ANSI_ESCAPE_RE.sub('', s)
+    # 再删除残留 ESC
+    s = s.replace('\x1b', '')
+    return s.strip()
 
 def clean_terminal_text(s):
     if not isinstance(s, str):
@@ -126,6 +136,14 @@ def execute_tool(call, arguments=None):
 def generate(model, tokenizer, messages, tools, args):
     streamer = TextStreamer(tokenizer, skip_prompt=True, skip_special_tokens=True)
     input_text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True, tools=tools, open_thinking=False)
+
+    # 5.3 修改generate()，检查input_ids是否是str。在出错时，能判断是input_text类型问题还是tokenizer编码问题
+    if not isinstance(input_text, str):
+        raise TypeError(
+            f"apply_chat_template should return str, got {type(input_text)}: {repr(input_text)[:500]}"
+        )
+    input_text = clean_terminal_text(input_text)
+
     inputs = tokenizer(input_text, return_tensors="pt", truncation=True).to(args.device)
     st = time.time()
     print('🧠: ', end='')
@@ -235,8 +253,30 @@ def main():
     else: client = OpenAI(api_key=args.api_key, base_url=args.api_base_url)
 
     input_mode = int(input('[0] 自动测试\n[1] 手动输入\n'))
-
-    cases = [{"prompt": case["prompt"], "tools": get_tools(case["tools"]), "tool_names": case["tools"]} for case in TEST_CASES] if input_mode == 0 else iter(lambda: {"prompt": input('💬: '), "tools": TOOLS, "tool_names": [t["function"]["name"] for t in TOOLS]}, {"prompt": "", "tools": TOOLS, "tool_names": []})
+    # 5.3 改手动输入逻辑
+    def manual_cases():
+        while True:
+            prompt = clean_terminal_text(input('💬: '))
+            if not prompt:
+                break
+            yield {
+                "prompt": prompt,
+                "tools": TOOLS,
+                "tool_names": [t["function"]["name"] for t in TOOLS]
+            }
+    
+    if input_mode == 0:
+        cases = [
+            {
+                "prompt": case["prompt"],
+                "tools": get_tools(case["tools"]),
+                "tool_names": case["tools"]
+            }
+            for case in TEST_CASES
+        ]
+    else:
+        cases = manual_cases()
+    # cases = [{"prompt": case["prompt"], "tools": get_tools(case["tools"]), "tool_names": case["tools"]} for case in TEST_CASES] if input_mode == 0 else iter(lambda: {"prompt": input('💬: '), "tools": TOOLS, "tool_names": [t["function"]["name"] for t in TOOLS]}, {"prompt": "", "tools": TOOLS, "tool_names": []})
     for case in cases:
         if not case["prompt"]: break
         setup_seed(random.randint(0, 31415926))
