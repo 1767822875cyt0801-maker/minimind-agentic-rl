@@ -374,21 +374,15 @@ def execute_tool(call, arguments=None):
 
     try:
         result = fn(args)
-        return {
-            "tool_name": name,
-            "ok": True,
-            "result": result
-        }
+        return result
     except Exception as e:
         return {
-            "tool_name": name,
-            "ok": False,
             "error": str(e)[:300]
         }
 
 
-def generate(model, tokenizer, messages, tools, args):
-    streamer = TextStreamer(tokenizer, skip_prompt=True, skip_special_tokens=True)
+def generate(model, tokenizer, messages, tools, args, stream_output=True):
+    streamer = TextStreamer(tokenizer, skip_prompt=True, skip_special_tokens=True) if stream_output else None
     input_text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True, tools=tools if tools else None, open_thinking=False)
 
     # 5.3 修改generate()，检查input_ids是否是str。在出错时，能判断是input_text类型问题还是tokenizer编码问题
@@ -400,7 +394,8 @@ def generate(model, tokenizer, messages, tools, args):
 
     inputs = tokenizer(input_text, return_tensors="pt", truncation=True).to(args.device)
     st = time.time()
-    print('🧠: ', end='')
+    if stream_output:
+        print('🧠: ', end='')
     generated_ids = model.generate(
         inputs["input_ids"], attention_mask=inputs["attention_mask"],
         max_new_tokens=args.max_new_tokens, do_sample=False, streamer=streamer,# tool calling 建议先关掉随机采样
@@ -409,7 +404,61 @@ def generate(model, tokenizer, messages, tools, args):
     )
     response = tokenizer.decode(generated_ids[0][len(inputs["input_ids"][0]):], skip_special_tokens=True)
     gen_tokens = len(generated_ids[0]) - len(inputs["input_ids"][0])
-    print(f'\n[Speed]: {gen_tokens / (time.time() - st):.2f} tokens/s') if args.show_speed else print()
+    if stream_output:
+        print(f'\n[Speed]: {gen_tokens / (time.time() - st):.2f} tokens/s') if args.show_speed else print()
+    return response
+
+
+def generate_final_answer(model, tokenizer, messages, args):
+    """
+    工具已经执行完之后，强制模型根据 tool result 生成最终答案。
+    这里不再传 tools，避免模型继续调用工具。
+    注意：部分小模型仍可能继续生成 <tool_call>，所以本函数只返回原始文本，
+    是否展示给用户由 run_case 里的 final formatter 决定。
+    """
+    final_messages = messages + [{
+        "role": "user",
+        "content": (
+            "请根据上面的工具返回结果，直接回答我的原始问题。"
+            "不要再输出 <tool_call>，不要再调用任何工具。"
+        )
+    }]
+
+    input_text = tokenizer.apply_chat_template(
+        final_messages,
+        tokenize=False,
+        add_generation_prompt=True,
+        tools=None,
+        open_thinking=False
+    )
+
+    if not isinstance(input_text, str):
+        raise TypeError(
+            f"apply_chat_template should return str, got {type(input_text)}: {repr(input_text)[:500]}"
+        )
+
+    input_text = clean_terminal_text(input_text)
+
+    inputs = tokenizer(
+        input_text,
+        return_tensors="pt",
+        truncation=True
+    ).to(args.device)
+
+    generated_ids = model.generate(
+        inputs["input_ids"],
+        attention_mask=inputs["attention_mask"],
+        max_new_tokens=min(args.max_new_tokens, 256),
+        do_sample=False,
+        pad_token_id=tokenizer.pad_token_id,
+        eos_token_id=tokenizer.eos_token_id,
+    )
+
+    response = tokenizer.decode(
+        generated_ids[0][len(inputs["input_ids"][0]):],
+        skip_special_tokens=True
+    )
+
     return response
 
 
@@ -463,100 +512,378 @@ def normalize_arguments_for_key(arguments):
     except Exception:
         return str(arguments)
 
-#增加工具调用轮数限制
-def run_case(prompt, tools, args, model=None, tokenizer=None, client=None):
-    messages = [{"role": "user", "content": prompt}]
 
+def format_scalar(value):
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+    return str(value)
+
+
+def clean_model_final_text(text):
+    if not isinstance(text, str):
+        return ""
+
+    text = clean_terminal_text(text)
+    text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL).strip()
+    text = re.sub(r'<tool_call>.*?</tool_call>', '', text, flags=re.DOTALL).strip()
+    text = re.sub(r'<tool_response>.*?</tool_response>', '', text, flags=re.DOTALL).strip()
+
+    if "<tool_call>" in text or "</tool_call>" in text:
+        return ""
+    return text
+
+
+def has_sqrt_intent(prompt):
+    prompt = str(prompt).lower()
+    return any(keyword in prompt for keyword in ["平方根", "开方", "根号", "sqrt", "square root"])
+
+
+def has_square_intent(prompt):
+    prompt = str(prompt).lower()
+    if has_sqrt_intent(prompt):
+        return False
+    return any(keyword in prompt for keyword in ["平方", "square"])
+
+
+def expression_has_sqrt(expression):
+    expression = str(expression).replace(" ", "").lower()
+    return any(mark in expression for mark in ["sqrt(", "**0.5", "^0.5"])
+
+
+def expression_is_square_of_value(expression, value):
+    expression = str(expression).replace(" ", "").lower()
+    value = format_scalar(value)
+    return any(pattern in expression for pattern in [
+        f"{value}**2",
+        f"{value}^2",
+        f"{value}*{value}",
+        f"pow({value},2)",
+    ])
+
+
+def latest_tool_result(tool_history, name):
+    for item in reversed(tool_history):
+        if item["name"] == name and isinstance(item["result"], dict):
+            return item["result"]
+    return None
+
+
+def has_tool_history(tool_history, name):
+    return any(item["name"] == name for item in tool_history)
+
+
+def maybe_fix_tool_call_arguments(prompt, tool_call, tool_history):
+    if tool_call["name"] != "calculate_math" or not has_sqrt_intent(prompt):
+        return tool_call, None
+
+    try:
+        parsed_args = parse_arguments(tool_call["arguments"])
+    except Exception:
+        return tool_call, None
+
+    expression = parsed_args.get("expression", "")
+    random_result = latest_tool_result(tool_history, "random_number")
+    random_value = random_result.get("result") if random_result else None
+
+    if random_value is None or expression_has_sqrt(expression):
+        return tool_call, None
+
+    if expression_is_square_of_value(expression, random_value):
+        fixed_args = dict(parsed_args)
+        fixed_args["expression"] = f"sqrt({format_scalar(random_value)})"
+        fixed_call = dict(tool_call)
+        fixed_call["arguments"] = fixed_args
+        return fixed_call, f"{expression} -> {fixed_args['expression']}"
+
+    return tool_call, None
+
+
+def build_missing_followup_tool_call(prompt, tool_history):
+    if has_tool_history(tool_history, "calculate_math"):
+        return None
+
+    random_result = latest_tool_result(tool_history, "random_number")
+    random_value = random_result.get("result") if random_result else None
+    if random_value is None:
+        return None
+
+    if has_sqrt_intent(prompt):
+        expression = f"sqrt({format_scalar(random_value)})"
+    elif has_square_intent(prompt):
+        expression = f"{format_scalar(random_value)}**2"
+    else:
+        return None
+
+    return {
+        "id": "auto_calculate_math",
+        "name": "calculate_math",
+        "arguments": {
+            "expression": expression
+        }
+    }
+
+
+def render_tool_calls_content(tool_calls):
+    blocks = []
+    for tc in tool_calls:
+        args = parse_arguments(tc["arguments"])
+        data = {
+            "name": tc["name"],
+            "arguments": args
+        }
+        blocks.append("<tool_call>\n" + json.dumps(data, ensure_ascii=False) + "\n</tool_call>")
+    return "\n\n".join(blocks)
+
+
+def format_tool_answer(name, arguments, result):
+    try:
+        parsed_args = parse_arguments(arguments)
+    except Exception:
+        parsed_args = {}
+
+    if not isinstance(result, dict):
+        return f"工具返回结果：{result}"
+
+    if "error" in result:
+        detail = result.get("detail")
+        return f"工具执行失败：{result['error']}" + (f"（{detail}）" if detail else "")
+
+    if name == "calculate_math":
+        expression = result.get("expression") or parsed_args.get("expression", "")
+        value = result.get("result")
+        return f"{expression} = {format_scalar(value)}" if expression else format_scalar(value)
+
+    if name == "get_current_time":
+        dt = result.get("datetime", "")
+        timezone = result.get("timezone", "")
+        weekday = result.get("weekday", "")
+        suffix = "，".join([x for x in [timezone, weekday] if x])
+        return f"当前时间是 {dt}" + (f"（{suffix}）" if suffix else "")
+
+    if name == "random_number":
+        value = result.get("result")
+        min_value = result.get("min")
+        max_value = result.get("max")
+        if min_value is not None and max_value is not None:
+            return f"生成的随机数是 {value}（范围：{min_value} 到 {max_value}）"
+        return f"生成的随机数是 {value}"
+
+    if name == "text_length":
+        return f"这段文本共有 {result.get('characters')} 个字符，{result.get('words')} 个单词"
+
+    if name == "unit_converter":
+        value = format_scalar(result.get("value"))
+        from_unit = result.get("from_unit", "")
+        converted = format_scalar(result.get("result"))
+        to_unit = result.get("to_unit", "")
+        return f"{value} {from_unit} = {converted} {to_unit}"
+
+    return json.dumps(result, ensure_ascii=False)
+
+
+def format_tool_history_answer(tool_history, original_prompt=""):
+    if not tool_history:
+        return ""
+
+    if len(tool_history) == 1:
+        item = tool_history[0]
+        return format_tool_answer(item["name"], item["arguments"], item["result"])
+
+    last = tool_history[-1]
+    if last["name"] == "calculate_math" and isinstance(last["result"], dict):
+        random_items = [
+            item for item in tool_history
+            if item["name"] == "random_number" and isinstance(item["result"], dict)
+        ]
+        expression = last["result"].get("expression") or ""
+        calc_value = format_scalar(last["result"].get("result"))
+        sqrt_intent = has_sqrt_intent(original_prompt) or expression_has_sqrt(expression)
+
+        if random_items:
+            random_value = format_scalar(random_items[-1]["result"].get("result"))
+            if sqrt_intent:
+                return f"生成的随机数是 {random_value}，它的平方根是 {calc_value}"
+            square_marks = ["**2", "^2", f"{random_value}*{random_value}", f"{random_value} * {random_value}"]
+            if any(mark in expression.replace(" ", "") for mark in square_marks[:3]) or square_marks[3] in expression:
+                return f"生成的随机数是 {random_value}，它的平方是 {calc_value}"
+            return f"生成的随机数是 {random_value}，计算结果是 {calc_value}"
+
+        if sqrt_intent:
+            return f"平方根是 {calc_value}"
+        return format_tool_answer(last["name"], last["arguments"], last["result"])
+
+    return "；".join(
+        format_tool_answer(item["name"], item["arguments"], item["result"])
+        for item in tool_history
+    )
+
+
+def print_final_answer(name=None, arguments=None, result=None, model_text="", tool_history=None, original_prompt=""):
+    answer = clean_model_final_text(model_text)
+    if not answer:
+        if tool_history:
+            answer = format_tool_history_answer(tool_history, original_prompt)
+        else:
+            answer = format_tool_answer(name, arguments, result)
+    print(f"🧠 Final: {answer}")
+
+
+def normalize_tool_calls(tool_calls):
+    normalized = []
+    for i, tc in enumerate(tool_calls or []):
+        if isinstance(tc, dict):
+            if "name" in tc:
+                name = tc.get("name", "")
+                arguments = tc.get("arguments", {})
+            else:
+                fn = tc.get("function", {})
+                name = fn.get("name", "")
+                arguments = fn.get("arguments", {})
+            call_id = tc.get("id") or f"call_{i}"
+        else:
+            fn = tc.function
+            name = fn.name
+            arguments = fn.arguments
+            call_id = tc.id or f"call_{i}"
+
+        normalized.append({
+            "id": call_id,
+            "name": name,
+            "arguments": arguments
+        })
+    return normalized
+
+
+def append_assistant_tool_message(messages, content, tool_calls, backend):
+    if backend == 'api':
+        messages.append({
+            "role": "assistant",
+            "content": content or "",
+            "tool_calls": [
+                {
+                    "id": tc["id"],
+                    "type": "function",
+                    "function": {
+                        "name": tc["name"],
+                        "arguments": tc["arguments"] if isinstance(tc["arguments"], str) else json.dumps(tc["arguments"], ensure_ascii=False)
+                    }
+                }
+                for tc in tool_calls
+            ]
+        })
+        return
+
+    messages.append({
+        "role": "assistant",
+        "content": content
+    })
+
+
+def append_tool_result_message(messages, tool_call, result, backend):
+    message = {
+        "role": "tool",
+        "content": json.dumps(result, ensure_ascii=False)
+    }
+    if backend == 'api':
+        message["tool_call_id"] = tool_call["id"]
+    messages.append(message)
+
+
+# 增加工具调用轮数限制：允许多轮工具调用，同时避免重复调用陷入循环
+def run_case(prompt, tools, args, model=None, tokenizer=None, client=None):
+    messages = [{"role": "user", "content": clean_terminal_text(prompt)}]
     max_tool_rounds = 4
-    seen_tool_calls = set()
+    seen_tool_calls = {}
+    tool_history = []
 
     for tool_round in range(max_tool_rounds):
         if args.backend == 'local':
-            content = generate(model, tokenizer, messages, tools, args)
+            show_model_output = not tool_history
+            content = generate(model, tokenizer, messages, tools, args, stream_output=show_model_output)
             tool_calls = parse_tool_calls(content)
         else:
+            show_model_output = True
             content, tool_calls = chat_api(client, messages, tools, args, stream=bool(args.stream))
 
         if not tool_calls:
-            break
+            if "<tool_call>" in content:
+                print("⚠️ 模型输出了 <tool_call>，但 JSON 解析失败，因此没有执行工具。")
+                if tool_history:
+                    print_final_answer(tool_history=tool_history, original_prompt=prompt)
+            elif tool_history:
+                followup_tc = build_missing_followup_tool_call(prompt, tool_history)
+                if followup_tc:
+                    print(f'🛠️ [Tool Auto]: {followup_tc["name"]} | args={followup_tc["arguments"]}')
+                    result = execute_tool(followup_tc if args.backend == 'local' else followup_tc["name"], followup_tc["arguments"])
+                    tool_history.append({
+                        "name": followup_tc["name"],
+                        "arguments": followup_tc["arguments"],
+                        "result": result
+                    })
+                    print(f'✅ [Tool Called]: {json.dumps(result, ensure_ascii=False)}')
+                print_final_answer(tool_history=tool_history, original_prompt=prompt)
+            return
 
-        if args.backend == 'api':
-            tool_calls = [{
-                "id": tc.id if hasattr(tc, 'id') else tc.get("id", ""),
-                "name": tc.function.name if hasattr(tc, 'function') else tc["function"]["name"],
-                "arguments": tc.function.arguments if hasattr(tc, 'function') else tc["function"]["arguments"]
-            } for tc in tool_calls]
+        tool_calls = normalize_tool_calls(tool_calls)
+        fixed_tool_calls = []
+        fixed_notes = []
+        for tc in tool_calls:
+            fixed_tc, fixed_note = maybe_fix_tool_call_arguments(prompt, tc, tool_history)
+            fixed_tool_calls.append(fixed_tc)
+            if fixed_note:
+                fixed_notes.append((tc["name"], fixed_note))
 
-        # 追加 assistant 的 tool_call 消息
-        if args.backend == 'local':
-            messages.append({
-                "role": "assistant",
-                "content": content
-            })
-        else:
-            messages.append({
-                "role": "assistant",
-                "content": content,
-                "tool_calls": [
-                    {
-                        "id": tc["id"],
-                        "type": "function",
-                        "function": {
-                            "name": tc["name"],
-                            "arguments": tc["arguments"]
-                        }
-                    }
-                    for tc in tool_calls
-                ]
-            })
+        tool_calls = fixed_tool_calls
+        if fixed_notes:
+            for fixed_name, fixed_note in fixed_notes:
+                print(f'🛠️ [Tool Args Fixed]: {fixed_name} | {fixed_note}')
+            if args.backend == 'local':
+                content = render_tool_calls_content(tool_calls)
 
-        repeated = False
+        if args.backend == 'local' and not show_model_output:
+            print(f'🧠: {content}')
 
+        append_assistant_tool_message(messages, content, tool_calls, args.backend)
+
+        executed_this_round = False
         for tc in tool_calls:
             name = tc["name"]
             arguments = tc["arguments"]
-
             call_key = (name, normalize_arguments_for_key(arguments))
 
             if call_key in seen_tool_calls:
-                repeated = True
-                break
-            #增加重复调用检测
-            seen_tool_calls.add(call_key)
+                previous_result = seen_tool_calls[call_key]
+                skipped_result = {
+                    "error": "Repeated tool call skipped",
+                    "previous_result": previous_result
+                }
+                print(f'⚠️ [Tool Skipped]: repeated {name} | args={arguments}')
+                append_tool_result_message(messages, tc, skipped_result, args.backend)
+                continue
 
             print(f'📞 [Tool Calling]: {name} | args={arguments}')
 
             result = execute_tool(tc if args.backend == 'local' else name, arguments)
+            seen_tool_calls[call_key] = result
+            tool_history.append({
+                "name": name,
+                "arguments": arguments,
+                "result": result
+            })
+            executed_this_round = True
 
             print(f'✅ [Tool Called]: {json.dumps(result, ensure_ascii=False)}')
+            append_tool_result_message(messages, tc, result, args.backend)
 
-            if args.backend == 'local':
-                messages.append({
-                    "role": "tool",
-                    "content": json.dumps(result, ensure_ascii=False)
-                })
-            else:
-                messages.append({
-                    "role": "tool",
-                    "content": json.dumps(result, ensure_ascii=False),
-                    "tool_call_id": tc["id"]
-                })
+        if not executed_this_round:
+            print_final_answer(tool_history=tool_history, original_prompt=prompt)
+            return
 
-        if repeated:
-            messages.append({
-                "role": "system",
-                "content": "The same tool call has already been executed. Do not call tools again. Use the existing tool result to answer the user."
-            })
+    print("⚠️ 达到最大工具调用轮数，停止继续调用工具。")
+    if tool_history:
+        print_final_answer(tool_history=tool_history, original_prompt=prompt)
 
-            if args.backend == 'local':
-                final_content = generate(model, tokenizer, messages, [], args)
-            else:
-                final_content, _ = chat_api(client, messages, [], args, stream=bool(args.stream))
 
-            break
-
-    else:
-        print("达到最大工具调用轮数，停止继续调用工具。")
 def main():
     parser = argparse.ArgumentParser(description="MiniMind ToolCall评测")
     parser.add_argument('--backend', default='local', choices=['local', 'api'], type=str, help="推理后端（local=本地模型，api=OpenAI兼容接口）")
