@@ -23,17 +23,28 @@ Instead, this project focuses on:
 
 ## Planned Modules
 
-- [ ] Project overview and source structure
-- [ ] Config
-- [ ] RMSNorm
-- [ ] RoPE
-- [ ] FeedForward / SwiGLU
-- [ ] Self-Attention
-- [ ] Multi-Head Attention
-- [ ] Transformer Block
-- [ ] KV Cache
-- [ ] Training loop
-- [ ] Inference / generation pipeline
+```markdown
+### Real Tool Calling Runtime
+
+This project includes an enhanced `eval_toolcall.py` script for testing MiniMind's tool-calling ability.
+
+Unlike the original mock-only version, the updated runtime can execute real Python tools. The current supported tools include:
+
+- `calculate_math`: safely evaluates math expressions
+- `get_current_time`: returns the current time in a specified timezone
+- `random_number`: generates a random number in a specified range
+- `text_length`: counts characters and words
+- `unit_converter`: converts basic length, weight, and temperature units
+
+The runtime follows this loop:
+
+```text
+User query
+→ Model generates <tool_call>
+→ Python parses the tool call
+→ The corresponding real tool function is executed
+→ Tool result is appended to the conversation
+→ Model generates the final answer
 
 ## Repository Structure
 
