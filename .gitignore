@@ -1,0 +1,67 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+
+# Jupyter
+.ipynb_checkpoints/
+*/.ipynb_checkpoints/
+
+# Logs
+*.log
+nohup.out
+logs/
+runs/
+wandb/
+tensorboard/
+lightning_logs/
+
+# Training outputs / checkpoints
+out/
+outputs/
+checkpoints/
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+
+# Large or generated datasets
+dataset/*.jsonl
+dataset/*.json
+dataset/*.parquet
+dataset/*.arrow
+dataset/*.bin
+
+# Keep small reproducible examples
+
+# Evaluation generated reports
+evals/reports/
+evals/reports0/
+reports/
+
+# But keep evaluation source data if needed
+!evals/tool_eval.jsonl
+!evals/tool_eval_hard.jsonl
+!evals/tool_eval_failure_modes.jsonl
+
+# Temporary/debug files
+tmp/
+scratch/
+debug/
+debug_outputs/
+untitled.txt
+*.tmp
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.vscode/
+
+# Secrets
+.env
+*.key
+*.pem
+
+# Ignore local dataset examples
+dataset/examples/
