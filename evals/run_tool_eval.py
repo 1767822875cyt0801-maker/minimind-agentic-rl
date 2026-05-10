@@ -100,7 +100,8 @@ def run_eval_case(item: Dict[str, Any], model, tokenizer, args) -> Dict[str, Any
 
 
 def build_error_result(item: Dict[str, Any], error: Exception) -> Dict[str, Any]:
-    error_msg = f"{type(error).__name__}: {error}"
+    exception_type = type(error).__name__
+    exception_msg = str(error)[:500]
     metrics = {
         "valid": False,
         "tool_acc": False,
@@ -108,38 +109,42 @@ def build_error_result(item: Dict[str, Any], error: Exception) -> Dict[str, Any]
         "obs_use_acc": False,
         "answer_acc": False,
         "loop": False,
-        "malformed": True,
+        "malformed": False,
         "unfinished": True,
         "tool_call_without_final": False,
         "tool_calls": 0,
         "failures": ["eval_exception"],
         "called_tools": [],
         "final_answer": "",
-        "error": error_msg,
+        "exception_type": exception_type,
+        "exception_msg": exception_msg,
     }
     trajectory = {
-        "task_id": str(item.get("id", "")),
-        "prompt": str(item.get("prompt", "")),
+        "task_id": str(item.get("id") or item.get("task_id") or ""),
+        "prompt": item.get("prompt", ""),
         "tools": item.get("tools", []),
-        "steps": [
-            {
-                "role": "system",
-                "type": "eval_exception",
-                "content": error_msg,
-                "meta": {"error": error_msg},
-            }
-        ],
+        "steps": [],
         "final_answer": "",
         "done": False,
         "reward": -3.0,
         "metrics": metrics,
     }
-    return {
-        "item": item,
-        "reward": -3.0,
-        "metrics": metrics,
-        "trajectory": trajectory,
-    }
+    return {"item": item, "reward": -3.0, "metrics": metrics, "trajectory": trajectory}
+
+
+def run_eval_items(items: List[Dict[str, Any]], model, tokenizer, args) -> List[Dict[str, Any]]:
+    results = []
+    for i, item in enumerate(items, start=1):
+        print(f"[{i}/{len(items)}] {item.get('id', '')}: {item.get('prompt', '')[:80]}")
+        try:
+            results.append(run_eval_case(item, model, tokenizer, args))
+        except Exception as exc:
+            if not args.continue_on_error:
+                raise
+            print(f"[eval_exception] {item.get('id', '')}: {type(exc).__name__}: {str(exc)[:300]}")
+            results.append(build_error_result(item, exc))
+    return results
+
 
 #计算某个布尔指标（如 "valid"）在所有结果中的平均值（比例）
 def average_bool(results: Iterable[Dict[str, Any]], key: str) -> float:
@@ -226,7 +231,7 @@ def main():
 
     #限制评估样本数量（调试用）
     parser.add_argument("--limit", default=0, type=int)
-    parser.add_argument("--continue_on_error", action="store_true", help="单条样本报错时记录错误并继续评测")
+    parser.add_argument("--continue_on_error", action="store_true", help="单条样本异常时记录 eval_exception 并继续评测")
     args = parser.parse_args()
 
     eval_path = Path(args.eval_path)
@@ -237,17 +242,8 @@ def main():
         items = items[: args.limit]
 
     model, tokenizer = init_local_model(args)
-    results = []
     start = time.time()
-    for i, item in enumerate(items, start=1):
-        print(f"[{i}/{len(items)}] {item.get('id', '')}: {item.get('prompt', '')[:80]}")
-        try:
-            results.append(run_eval_case(item, model, tokenizer, args))
-        except Exception as e:
-            if not args.continue_on_error:
-                raise
-            print(f"[ERROR] {item.get('id', '')}: {type(e).__name__}: {e}")
-            results.append(build_error_result(item, e))
+    results = run_eval_items(items, model, tokenizer, args)
     summary = build_summary(results, args)
     summary["elapsed_sec"] = round(time.time() - start, 3)
     write_outputs(results, summary, args)

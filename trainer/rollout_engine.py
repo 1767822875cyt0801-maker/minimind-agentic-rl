@@ -47,7 +47,7 @@ class RolloutEngine(ABC):
     tokenizer = None
     
     @abstractmethod
-    def rollout(self, prompt_ids: Tensor, attention_mask: Tensor, num_generations: int, max_new_tokens: int, temperature: float = 0.8) -> RolloutResult:
+    def rollout(self, prompt_ids: Tensor, attention_mask: Tensor, num_generations: int, max_new_tokens: int, temperature: float = 0.8, top_p: float = 1.0) -> RolloutResult:
         pass
     
     @abstractmethod
@@ -63,7 +63,7 @@ class TorchRolloutEngine(RolloutEngine):
         self.device = device
         self.autocast_ctx = autocast_ctx
     
-    def rollout(self, prompt_ids: Tensor, attention_mask: Tensor, num_generations: int, max_new_tokens: int, temperature: float = 0.8) -> RolloutResult:
+    def rollout(self, prompt_ids: Tensor, attention_mask: Tensor, num_generations: int, max_new_tokens: int, temperature: float = 0.8, top_p: float = 1.0) -> RolloutResult:
         model = self.policy_model.module if isinstance(self.policy_model, DistributedDataParallel) else self.policy_model
         
         with torch.no_grad():
@@ -73,6 +73,7 @@ class TorchRolloutEngine(RolloutEngine):
                 max_new_tokens=max_new_tokens,
                 do_sample=True,
                 temperature=temperature,
+                top_p=top_p,
                 num_return_sequences=num_generations,
                 pad_token_id=self.tokenizer.pad_token_id,
                 eos_token_id=self.tokenizer.eos_token_id,
@@ -106,7 +107,7 @@ class SGLangRolloutEngine(RolloutEngine):
         self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
         self.http = requests
     #prompt_ids: [B, P]  attention_mask: [B, P]
-    def rollout(self, prompt_ids: Tensor, attention_mask: Tensor, num_generations: int, max_new_tokens: int, temperature: float = 0.8) -> RolloutResult:
+    def rollout(self, prompt_ids: Tensor, attention_mask: Tensor, num_generations: int, max_new_tokens: int, temperature: float = 0.8, top_p: float = 1.0) -> RolloutResult:
         # 去除左侧 padding tokens，只保留有效 token
         input_ids_list = []
         for ids, mask in zip(prompt_ids, attention_mask):
@@ -118,6 +119,7 @@ class SGLangRolloutEngine(RolloutEngine):
             "input_ids": all_input_ids,
             "sampling_params": {
                 "temperature": temperature,
+                "top_p": top_p,
                 "max_new_tokens": max_new_tokens,
                 "stop_token_ids": [self.tokenizer.eos_token_id] if self.tokenizer.eos_token_id else [],
             },

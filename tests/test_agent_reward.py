@@ -233,6 +233,160 @@ def test_expected_obs_keys_accepts_requested_text_length_field():
     assert info["answer_acc"]
 
 
+def test_expected_obs_keys_missing_tool_falls_back_to_default_keys():
+    _, info = compute_total_reward(
+        build_single_tool_traj(
+            "unit_converter",
+            {"value": 5, "from_unit": "kg", "to_unit": "pounds"},
+            {"value": 5.0, "from_unit": "kg", "to_unit": "pounds", "result": 11.023113},
+            "5 kg 约等于 11.02 pounds。",
+        ),
+        {
+            "expected_tool_sequence": ["unit_converter"],
+            "expected_args": {"unit_converter": {"value": 5, "from_unit": "kg", "to_unit": "pounds"}},
+            "expected_obs_keys": {"text_length": ["words"]},
+            "expected_answer": "11.023",
+            "expected_answer_type": "number",
+            "max_tool_calls": 1,
+        },
+    )
+    assert info["obs_use_acc"]
+    assert info["answer_acc"]
+
+
+def test_expected_obs_keys_accepts_string_value():
+    _, info = compute_total_reward(
+        build_single_tool_traj(
+            "text_length",
+            {"text": "OpenAI API"},
+            {"text": "OpenAI API", "characters": 10, "words": 2},
+            "这段文本共有 2 个单词。",
+        ),
+        {
+            "expected_tool_sequence": ["text_length"],
+            "expected_args": {"text_length": {"text": "OpenAI API"}},
+            "expected_obs_keys": {"text_length": "words"},
+            "expected_answer": "2",
+            "expected_answer_type": "number",
+            "max_tool_calls": 1,
+        },
+    )
+    assert info["obs_use_acc"]
+    assert info["answer_acc"]
+
+
+def test_expected_obs_keys_empty_list_falls_back_to_default_keys():
+    _, info = compute_total_reward(
+        build_single_tool_traj(
+            "text_length",
+            {"text": "OpenAI API"},
+            {"text": "OpenAI API", "characters": 10, "words": 2},
+            "这段文本共有 10 个字符。",
+        ),
+        {
+            "expected_tool_sequence": ["text_length"],
+            "expected_args": {"text_length": {"text": "OpenAI API"}},
+            "expected_obs_keys": {"text_length": []},
+            "expected_answer": "10",
+            "expected_answer_type": "number",
+            "max_tool_calls": 1,
+        },
+    )
+    assert info["obs_use_acc"]
+    assert info["answer_acc"]
+
+
+def test_hard_multistep_trajectory_gets_high_reward():
+    traj = ToolTrajectory(
+        task_id="hard_tm_test",
+        prompt="统计 OpenAI API 的字符数，然后把字符数乘以3",
+        tools=["text_length", "calculate_math"],
+        steps=[
+            TrajectoryStep(role="user", type="user", content="统计 OpenAI API 的字符数，然后把字符数乘以3"),
+            TrajectoryStep(
+                role="assistant",
+                type="assistant_tool_call",
+                content="",
+                meta={"name": "text_length", "arguments": {"text": "OpenAI API"}},
+            ),
+            TrajectoryStep(
+                role="tool",
+                type="tool_observation",
+                content="",
+                meta={"name": "text_length", "arguments": {"text": "OpenAI API"}, "result": {"text": "OpenAI API", "characters": 10, "words": 2}},
+            ),
+            TrajectoryStep(
+                role="assistant",
+                type="assistant_tool_call",
+                content="",
+                meta={"name": "calculate_math", "arguments": {"expression": "10*3"}},
+            ),
+            TrajectoryStep(
+                role="tool",
+                type="tool_observation",
+                content="",
+                meta={"name": "calculate_math", "arguments": {"expression": "10*3"}, "result": {"expression": "10*3", "result": 30}},
+            ),
+            TrajectoryStep(role="assistant", type="assistant_final", content="计算结果是 30。"),
+        ],
+        final_answer="计算结果是 30。",
+        done=True,
+    )
+    reward, info = compute_total_reward(
+        traj,
+        {
+            "expected_tool_sequence": ["text_length", "calculate_math"],
+            "expected_args": {"text_length": {"text": "OpenAI API"}, "calculate_math": {"expression": "10*3"}},
+            "expected_obs_keys": {"text_length": ["characters"], "calculate_math": ["result"]},
+            "expected_answer": "30",
+            "expected_answer_type": "number",
+            "max_tool_calls": 2,
+        },
+    )
+    assert info["tool_acc"]
+    assert info["args_acc"]
+    assert info["obs_use_acc"]
+    assert info["answer_acc"]
+    assert reward > 2.0
+
+
+def test_tool_call_without_final_is_failure():
+    traj = ToolTrajectory(
+        task_id="no_final",
+        prompt="计算 9 的平方根",
+        tools=["calculate_math"],
+        steps=[
+            TrajectoryStep(role="user", type="user", content="计算 9 的平方根"),
+            TrajectoryStep(
+                role="assistant",
+                type="assistant_tool_call",
+                content="",
+                meta={"name": "calculate_math", "arguments": {"expression": "sqrt(9)"}},
+            ),
+            TrajectoryStep(
+                role="tool",
+                type="tool_observation",
+                content="",
+                meta={"name": "calculate_math", "arguments": {"expression": "sqrt(9)"}, "result": {"expression": "sqrt(9)", "result": 3}},
+            ),
+        ],
+        final_answer="",
+        done=True,
+    )
+    _, info = compute_total_reward(
+        traj,
+        {
+            "expected_tool_sequence": ["calculate_math"],
+            "expected_args": {"calculate_math": {"expression": "sqrt(9)"}},
+            "expected_answer": "3",
+            "expected_answer_type": "number",
+            "max_tool_calls": 1,
+        },
+    )
+    assert info["tool_call_without_final"]
+    assert "tool_call_without_final" in info["failures"]
+
+
 def test_reward_penalizes_loop():
     env = ToolUseEnv(mode="guarded")
     env.reset({"id": "loop_001", "prompt": "算 1+1", "tools": ["calculate_math"]})
@@ -267,4 +421,141 @@ def test_reward_penalizes_unnecessary_tool_for_no_tool_task():
     assert "unnecessary_tool" in bad_info["failures"]
     assert bad_info["unnecessary_tool_penalty"] == -0.5
     assert good_info["unnecessary_tool_penalty"] == 0.0
+    assert good_reward > bad_reward
+
+
+def build_repeated_math_traj(final_answer="5"):
+    return ToolTrajectory(
+        task_id="dense_repeat",
+        prompt="first compute 1+1, then compute 2+3",
+        tools=["calculate_math"],
+        steps=[
+            TrajectoryStep(role="user", type="user", content="first compute 1+1, then compute 2+3"),
+            TrajectoryStep(
+                role="assistant",
+                type="assistant_tool_call",
+                content="",
+                meta={"name": "calculate_math", "arguments": {"expression": "1+1"}},
+            ),
+            TrajectoryStep(
+                role="tool",
+                type="tool_observation",
+                content="",
+                meta={"name": "calculate_math", "arguments": {"expression": "1+1"}, "result": {"expression": "1+1", "result": 2}},
+            ),
+            TrajectoryStep(
+                role="assistant",
+                type="assistant_tool_call",
+                content="",
+                meta={"name": "calculate_math", "arguments": {"expression": "2+3"}},
+            ),
+            TrajectoryStep(
+                role="tool",
+                type="tool_observation",
+                content="",
+                meta={"name": "calculate_math", "arguments": {"expression": "2+3"}, "result": {"expression": "2+3", "result": 5}},
+            ),
+            TrajectoryStep(role="assistant", type="assistant_final", content=final_answer),
+        ],
+        final_answer=final_answer,
+        done=True,
+    )
+
+
+def test_repeated_tool_expected_args_are_matched_by_occurrence():
+    task = {
+        "expected_tool_sequence": ["calculate_math", "calculate_math"],
+        "expected_args": {"calculate_math": [{"expression": "1+1"}, {"expression": "2+3"}]},
+        "expected_obs_keys": {"calculate_math": ["result"]},
+        "expected_answer": "5",
+        "expected_answer_type": "number",
+        "max_tool_calls": 2,
+    }
+
+    _, good_info = compute_total_reward(build_repeated_math_traj(), task)
+    _, bad_info = compute_total_reward(
+        build_repeated_math_traj(),
+        {**task, "expected_args": {"calculate_math": [{"expression": "2+3"}, {"expression": "1+1"}]}},
+    )
+
+    assert good_info["args_acc"]
+    assert not bad_info["args_acc"]
+
+
+def test_dense_v2_correct_trajectory_is_high_but_not_saturated():
+    task = {
+        "expected_tool_sequence": ["calculate_math", "calculate_math"],
+        "expected_args": {"calculate_math": [{"expression": "1+1"}, {"expression": "2+3"}]},
+        "expected_obs_keys": {"calculate_math": ["result"]},
+        "expected_answer": "5",
+        "expected_answer_type": "number",
+        "max_tool_calls": 2,
+        "reward_profile": "dense_v2",
+    }
+
+    reward, info = compute_total_reward(build_repeated_math_traj("after 2, final result is 5"), task)
+
+    assert info["reward_profile"] == "dense_v2"
+    assert info["answer_acc"]
+    assert 2.0 < reward < 3.0
+
+
+def test_dense_v2_penalizes_extra_tool_call():
+    task = {
+        "expected_tool_sequence": ["calculate_math"],
+        "expected_args": {"calculate_math": {"expression": "2+3"}},
+        "expected_obs_keys": {"calculate_math": ["result"]},
+        "expected_answer": "5",
+        "expected_answer_type": "number",
+        "max_tool_calls": 1,
+        "reward_profile": "dense_v2",
+    }
+    good = build_single_tool_traj("calculate_math", {"expression": "2+3"}, {"expression": "2+3", "result": 5}, "5")
+    extra = build_repeated_math_traj("5")
+
+    good_reward, _ = compute_total_reward(good, task)
+    extra_reward, extra_info = compute_total_reward(extra, task)
+
+    assert "overuse_tool" in extra_info["failures"]
+    assert good_reward > extra_reward
+
+
+def test_dense_v2_rewards_grounded_answer_over_ungrounded_correct_answer():
+    task = {
+        "expected_tool_sequence": ["calculate_math"],
+        "expected_args": {"calculate_math": {"expression": "1+2"}},
+        "expected_obs_keys": {"calculate_math": ["result"]},
+        "expected_answer": "12",
+        "expected_answer_type": "number",
+        "max_tool_calls": 1,
+        "reward_profile": "dense_v2",
+    }
+    ungrounded = build_single_tool_traj("calculate_math", {"expression": "1+2"}, {"expression": "1+2", "result": 3}, "12")
+    grounded = build_single_tool_traj("calculate_math", {"expression": "1+2"}, {"expression": "1+2", "result": 3}, "tool result 3, final answer 12")
+
+    ungrounded_reward, ungrounded_info = compute_total_reward(ungrounded, task)
+    grounded_reward, grounded_info = compute_total_reward(grounded, task)
+
+    assert ungrounded_info["answer_acc"]
+    assert not ungrounded_info["obs_use_strict_acc"]
+    assert grounded_info["obs_use_strict_acc"]
+    assert grounded_reward > ungrounded_reward
+
+
+def test_dense_v2_no_tool_task_penalizes_unnecessary_tool():
+    task = {
+        "expected_tool_sequence": [],
+        "expected_args": {},
+        "args_match": "none",
+        "max_tool_calls": 0,
+        "allow_no_tool": True,
+        "reward_profile": "dense_v2",
+    }
+    good_reward, _ = compute_total_reward(build_final_traj("Answer directly without a tool."), task)
+    bad_reward, bad_info = compute_total_reward(
+        build_single_tool_traj("calculate_math", {"expression": "2+2"}, {"expression": "2+2", "result": 4}, "Answer directly without a tool."),
+        task,
+    )
+
+    assert "unnecessary_tool" in bad_info["failures"]
     assert good_reward > bad_reward

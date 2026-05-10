@@ -28,6 +28,7 @@ from trainer.rollout_engine import create_rollout_engine, compute_per_token_logp
 from agent.parser import parse_tool_calls as parse_tool_call_results
 from agent.reward import aggregate_reward_infos, compute_total_reward
 from agent.tool_env import ToolUseEnv
+from agent.trajectory import trajectory_to_dict
 from agent.tools import execute_tool_call, validate_tool_args
 
 warnings.filterwarnings('ignore')
@@ -94,7 +95,67 @@ def execute_tool(name, args):
     return execute_tool_call(name, args)
 
 # ======== 多轮 Rollout ========
-def rollout_single(rollout_engine, tokenizer, messages, tools, max_turns=3, max_new_tokens=256, thinking_ratio=0.5, device="cuda", env_mode="raw"):
+def build_rollout_task(messages, tools, task=None):
+    rollout_task = dict(task or {})
+    rollout_task["messages"] = [dict(m) for m in messages]
+    rollout_task["tools"] = tools
+    if not rollout_task.get("prompt"):
+        for msg in messages:
+            if isinstance(msg, dict) and msg.get("role") == "user":
+                rollout_task["prompt"] = str(msg.get("content", ""))
+                break
+    return rollout_task
+
+
+def compute_group_reward_stats(rewards, num_generations, zero_threshold=1e-6):
+    if num_generations <= 0:
+        raise ValueError("num_generations must be positive")
+    flat_rewards = rewards.detach().float()
+    if flat_rewards.numel() == 0:
+        return {
+            "reward_min": 0.0,
+            "reward_max": 0.0,
+            "group_reward_std": 0.0,
+            "zero_group_rate": 0.0,
+        }
+    if flat_rewards.numel() % num_generations != 0:
+        raise ValueError("reward count must be divisible by num_generations")
+    grouped = flat_rewards.view(-1, num_generations)
+    group_std = grouped.std(dim=1, unbiased=False)
+    return {
+        "reward_min": flat_rewards.min().item(),
+        "reward_max": flat_rewards.max().item(),
+        "group_reward_std": group_std.mean().item(),
+        "zero_group_rate": (group_std < zero_threshold).float().mean().item(),
+    }
+
+
+def build_rollout_trace_record(step, task, reward, reward_info, trajectory):
+    task = task or {}
+    reward_info = reward_info or {}
+    return {
+        "step": step,
+        "task_id": str(task.get("id") or task.get("task_id") or getattr(trajectory, "task_id", "")),
+        "category": task.get("category", ""),
+        "reward": float(reward),
+        "failures": reward_info.get("failures", []),
+        "called_tools": reward_info.get("called_tools", []),
+        "final_answer": reward_info.get("final_answer", getattr(trajectory, "final_answer", "")),
+        "trajectory": trajectory_to_dict(trajectory),
+    }
+
+
+def append_rollout_trace(path, records):
+    if not path or not records:
+        return
+    target = os.path.abspath(path)
+    os.makedirs(os.path.dirname(target), exist_ok=True)
+    with open(target, "a", encoding="utf-8", newline="\n") as f:
+        for record in records:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+def rollout_single(rollout_engine, tokenizer, messages, tools, task=None, max_turns=3, max_new_tokens=256, thinking_ratio=0.5, device="cuda", env_mode="raw", temperature=0.8, top_p=1.0):
     all_outputs = []
     prompt_ids = None
     response_ids = []
@@ -104,7 +165,7 @@ def rollout_single(rollout_engine, tokenizer, messages, tools, max_turns=3, max_
     unfinished = False
     open_thinking = random.random() < thinking_ratio
     env = ToolUseEnv(mode=env_mode, max_tool_calls=max_turns)
-    env.reset({"messages": messages, "tools": tools})
+    env.reset(build_rollout_task(messages, tools, task))
     for turn in range(max_turns):
         context = tokenizer.apply_chat_template(env.get_messages(), tokenize=False, add_generation_prompt=True, tools=env.get_tool_schemas() or tools, open_thinking=open_thinking)
         inputs = tokenizer(context, return_tensors="pt", add_special_tokens=False).to(device)
@@ -116,7 +177,8 @@ def rollout_single(rollout_engine, tokenizer, messages, tools, max_turns=3, max_
             attention_mask=inputs["attention_mask"],
             num_generations=1,
             max_new_tokens=max_new_tokens,
-            temperature=0.8,
+            temperature=temperature,
+            top_p=top_p,
         )
         new_ids = rollout_result.completion_ids[0].tolist()
         new_logps = rollout_result.per_token_logps[0].tolist()
@@ -153,7 +215,7 @@ def rollout_single(rollout_engine, tokenizer, messages, tools, max_turns=3, max_
     prompt_ids = prompt_ids or []
     return final_output, final_context, prompt_ids, response_ids, response_mask, response_old_logps, list(all_outputs), unfinished, trajectory
 
-def rollout_batch(rollout_engine, tokenizer, messages_batch, tools_batch, num_gen, max_turns=3, max_new_tokens=256, thinking_ratio=0.5, device="cuda", env_mode="raw"):
+def rollout_batch(rollout_engine, tokenizer, messages_batch, tools_batch, num_gen, tasks_batch=None, max_turns=3, max_new_tokens=256, thinking_ratio=0.5, device="cuda", env_mode="raw", temperature=0.8, top_p=1.0):
     all_completions = []
     all_contexts = []
     all_prompt_ids = []
@@ -163,10 +225,25 @@ def rollout_batch(rollout_engine, tokenizer, messages_batch, tools_batch, num_ge
     all_turn_outputs = []
     all_unfinished = []
     all_trajectories = []
-    for messages, tools in zip(messages_batch, tools_batch):
+    if tasks_batch is None:
+        tasks_batch = [{} for _ in messages_batch]
+    for messages, tools, task in zip(messages_batch, tools_batch, tasks_batch):
         for _ in range(num_gen):
             msgs_copy = [dict(m) for m in messages]
-            completion, context, prompt_ids, response_ids, response_mask, response_old_logps, turn_outputs, unfinished, trajectory = rollout_single(rollout_engine, tokenizer, msgs_copy, tools, max_turns, max_new_tokens, thinking_ratio, device, env_mode)
+            completion, context, prompt_ids, response_ids, response_mask, response_old_logps, turn_outputs, unfinished, trajectory = rollout_single(
+                rollout_engine,
+                tokenizer,
+                msgs_copy,
+                tools,
+                task=task,
+                max_turns=max_turns,
+                max_new_tokens=max_new_tokens,
+                thinking_ratio=thinking_ratio,
+                device=device,
+                env_mode=env_mode,
+                temperature=temperature,
+                top_p=top_p,
+            )
             all_completions.append(completion)
             all_contexts.append(context)
             all_prompt_ids.append(prompt_ids)
@@ -260,7 +337,21 @@ def rl_train_epoch(epoch, loader, iters, rollout_engine, ref_model, reward_model
         last_step = step
 
         with torch.no_grad():
-            completions, contexts, prompt_ids_batch, response_ids_batch, response_masks_batch, response_old_logps_batch, turn_outputs_batch, unfinished_batch, trajectory_batch = rollout_batch(rollout_engine, tokenizer, messages_batch, tools_batch, args.num_generations, max_turns=3, max_new_tokens=args.max_gen_len, thinking_ratio=args.thinking_ratio, device=args.device, env_mode=args.tool_env_mode)
+            completions, contexts, prompt_ids_batch, response_ids_batch, response_masks_batch, response_old_logps_batch, turn_outputs_batch, unfinished_batch, trajectory_batch = rollout_batch(
+                rollout_engine,
+                tokenizer,
+                messages_batch,
+                tools_batch,
+                args.num_generations,
+                tasks_batch=tasks_batch,
+                max_turns=args.max_tool_turns,
+                max_new_tokens=args.max_gen_len,
+                thinking_ratio=args.thinking_ratio,
+                device=args.device,
+                env_mode=args.tool_env_mode,
+                temperature=args.rollout_temperature,
+                top_p=args.rollout_top_p,
+            )
 
         prompts = [tokenizer.apply_chat_template(m, tokenize=False, add_generation_prompt=True, tools=t) for m, t in zip(messages_batch, tools_batch)]
         packed_samples = []
@@ -302,6 +393,20 @@ def rl_train_epoch(epoch, loader, iters, rollout_engine, ref_model, reward_model
         valid_rows = token_counts > 0
         rewards, reward_infos = calculate_rewards(prompts, completions, gt_batch, tools_batch, args.num_generations, reward_model, device=args.device, turn_outputs_batch=turn_outputs_batch, unfinished_batch=unfinished_batch, trajectory_batch=trajectory_batch, tasks_batch=tasks_batch, return_infos=True)
         reward_breakdown = aggregate_reward_infos(reward_infos)
+        reward_stats = compute_group_reward_stats(rewards, args.num_generations, args.reward_std_warn_threshold)
+
+        if args.save_rollout_trace_path and is_main_process() and (step % args.log_interval == 0 or step == iters):
+            trace_records = [
+                build_rollout_trace_record(
+                    step,
+                    tasks_batch[idx // args.num_generations] if tasks_batch else {},
+                    rewards[idx].item(),
+                    reward_infos[idx],
+                    trajectory_batch[idx],
+                )
+                for idx in range(len(trajectory_batch))
+            ]
+            append_rollout_trace(args.save_rollout_trace_path, trace_records)
 
         if args.debug_mode and is_main_process() and step % args.debug_interval == 0:
             for i in range(len(messages_batch)):
@@ -356,7 +461,10 @@ def rl_train_epoch(epoch, loader, iters, rollout_engine, ref_model, reward_model
             ar = rewards.mean().item()
             al = token_counts.float().mean().item()
             kl = ((ref_per_token_logps - per_token_logps) * completion_mask).sum().item() / max(token_counts.sum().item(), 1)
-            gs = grouped_rewards.std(dim=1, unbiased=False).mean().item()
+            gs = reward_stats["group_reward_std"]
+            rmin = reward_stats["reward_min"]
+            rmax = reward_stats["reward_max"]
+            zero_group_rate = reward_stats["zero_group_rate"]
             am, ast = advantages.mean().item(), advantages.std().item()
             lr = optimizer.param_groups[0]['lr']
             if gs < args.reward_std_warn_threshold:
@@ -364,7 +472,8 @@ def rl_train_epoch(epoch, loader, iters, rollout_engine, ref_model, reward_model
             rb = reward_breakdown
             Logger(
                 f'Epoch:[{epoch+1}/{args.epochs}]({step}/{iters}), Reward:{ar:.4f}, KL:{kl:.4f}, '
-                f'ClipFrac:{clip_frac:.4f}, GrpStd:{gs:.4f}, AdvStd:{ast:.4f}, Loss:{pl:.4f}, AvgLen:{al:.2f}, '
+                f'ClipFrac:{clip_frac:.4f}, RewardMin:{rmin:.4f}, RewardMax:{rmax:.4f}, '
+                f'GrpStd:{gs:.4f}, ZeroGrpRate:{zero_group_rate:.3f}, AdvStd:{ast:.4f}, Loss:{pl:.4f}, AvgLen:{al:.2f}, '
                 f'ToolCalls:{rb.get("tool_calls", 0.0):.2f}, Valid:{rb.get("valid", 0.0):.3f}, '
                 f'ToolAcc:{rb.get("tool_acc", 0.0):.3f}, ArgsAcc:{rb.get("args_acc", 0.0):.3f}, '
                 f'ObsUse:{rb.get("obs_use_acc", 0.0):.3f}, AnsAcc:{rb.get("answer_acc", 0.0):.3f}, '
@@ -372,7 +481,20 @@ def rl_train_epoch(epoch, loader, iters, rollout_engine, ref_model, reward_model
                 f'AdvMean:{am:.4f}, LR:{lr:.8f}'
             )
             if wandb and is_main_process():
-                wandb_payload = {"reward":ar,"kl_ref":kl,"clip_frac":clip_frac,"group_reward_std":gs,"advantages_std":ast,"policy_loss":pl,"avg_response_len":al,"advantages_mean":am,"learning_rate":lr}
+                wandb_payload = {
+                    "reward": ar,
+                    "kl_ref": kl,
+                    "clip_frac": clip_frac,
+                    "reward_min": rmin,
+                    "reward_max": rmax,
+                    "group_reward_std": gs,
+                    "zero_group_rate": zero_group_rate,
+                    "advantages_std": ast,
+                    "policy_loss": pl,
+                    "avg_response_len": al,
+                    "advantages_mean": am,
+                    "learning_rate": lr,
+                }
                 wandb_payload.update({f"reward_breakdown/{k}": v for k, v in reward_breakdown.items()})
                 wandb.log(wandb_payload)
 
@@ -433,6 +555,10 @@ if __name__ == "__main__":
     parser.add_argument("--debug_interval", type=int, default=20, help="调试日志间隔")
     parser.add_argument("--thinking_ratio", type=float, default=0.1, help="按概率开启thinking（0.0~1.0）")
     parser.add_argument("--tool_env_mode", type=str, default="raw", choices=["raw", "guarded"], help="工具环境模式")
+    parser.add_argument("--rollout_temperature", type=float, default=0.8, help="rollout sampling temperature")
+    parser.add_argument("--rollout_top_p", type=float, default=1.0, help="rollout nucleus sampling top_p")
+    parser.add_argument("--max_tool_turns", type=int, default=3, help="maximum tool interaction turns during rollout")
+    parser.add_argument("--save_rollout_trace_path", type=str, default="", help="optional JSONL path for rollout trace summaries")
     parser.add_argument("--use_reward_model", action="store_true", help="是否额外加载文本Reward模型")
     parser.add_argument("--reward_std_warn_threshold", type=float, default=1e-6, help="组内reward方差过低时打印警告")
     parser.add_argument("--reward_model_path", type=str, default="../../internlm2-1_8b-reward", help="Reward模型路径")

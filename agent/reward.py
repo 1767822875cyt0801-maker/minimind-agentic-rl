@@ -178,6 +178,13 @@ def _args_equivalent(tool_name: str, actual: Dict[str, Any], expected: Dict[str,
 
 #核心评估函数
 #输入一条完整的ToolTrajectory，返回一个字典，包含评估结果
+def _expected_args_for_call(expected_args: Dict[str, Any], tool_name: str, occurrence_idx: int) -> Dict[str, Any]:
+    exp = expected_args.get(tool_name, {})
+    if isinstance(exp, list):
+        return exp[occurrence_idx] if occurrence_idx < len(exp) else {}
+    return exp if isinstance(exp, dict) else {}
+
+
 def evaluate_trajectory(traj: ToolTrajectory, task: Dict[str, Any]) -> Dict[str, Any]:
     tool_calls = _tool_steps(traj)
     observations = _observation_steps(traj)
@@ -208,6 +215,7 @@ def evaluate_trajectory(traj: ToolTrajectory, task: Dict[str, Any]) -> Dict[str,
 
     args_ok = True
     if expected_args:
+        occurrence_counts: Dict[str, int] = {}
         for idx, tool_name in enumerate(expected_sequence or called_names):
             matching_call = None
             if idx < len(tool_calls) and tool_calls[idx].get("name") == tool_name:
@@ -217,9 +225,9 @@ def evaluate_trajectory(traj: ToolTrajectory, task: Dict[str, Any]) -> Dict[str,
             if matching_call is None:
                 args_ok = False
                 break
-            exp = expected_args.get(tool_name, {})
-            if isinstance(exp, list):
-                exp = exp[min(idx, len(exp) - 1)] if exp else {}
+            occurrence_idx = occurrence_counts.get(tool_name, 0)
+            occurrence_counts[tool_name] = occurrence_idx + 1
+            exp = _expected_args_for_call(expected_args, tool_name, occurrence_idx)
             if not _args_equivalent(tool_name, matching_call.get("arguments") or {}, exp, args_match_mode):
                 args_ok = False
                 break
@@ -241,9 +249,17 @@ def evaluate_trajectory(traj: ToolTrajectory, task: Dict[str, Any]) -> Dict[str,
             for key in keys:
                 if key in result:
                     obs_values.append(str(result[key]))
-    obs_use = True if not observations else any(_obs_value_used(final_answer, value) for value in obs_values)
+    obs_use_strict = True if not observations else any(_obs_value_used(final_answer, value) for value in obs_values)
+    obs_use = obs_use_strict
     if expected_answer is not None:
         obs_use = obs_use or answer_acc
+
+    if max_tool_calls is not None:
+        extra_tool_calls = max(0, len(tool_calls) - int(max_tool_calls))
+    elif expected_sequence:
+        extra_tool_calls = max(0, len(tool_calls) - len(expected_sequence))
+    else:
+        extra_tool_calls = 0
 
     valid = not malformed and not overuse and (allow_no_tool or bool(tool_calls) or expected_sequence == [])
 
@@ -276,21 +292,40 @@ def evaluate_trajectory(traj: ToolTrajectory, task: Dict[str, Any]) -> Dict[str,
         "tool_acc": tool_acc,
         "args_acc": args_ok,
         "obs_use_acc": obs_use,
+        "obs_use_strict_acc": obs_use_strict,
         "answer_acc": answer_acc,
         "loop": loop,
         "malformed": malformed,
         "unfinished": unfinished,
         "tool_call_without_final": no_final_after_tool,
         "tool_calls": len(tool_calls),
+        "extra_tool_calls": extra_tool_calls,
         "failures": failures,
         "called_tools": called_names,
         "final_answer": final_answer,
     }
 
 #总奖励计算
-def compute_total_reward(traj: ToolTrajectory, task: Dict[str, Any]) -> Tuple[float, Dict[str, Any]]:
-    metrics = evaluate_trajectory(traj, task)
-    reward_info = {
+def _expected_tool_count(task: Dict[str, Any], metrics: Dict[str, Any]) -> int:
+    expected_sequence = _as_list(task.get("expected_tool_sequence"))
+    if expected_sequence:
+        return len(expected_sequence)
+    if task.get("max_tool_calls") is not None:
+        return int(task.get("max_tool_calls") or 0)
+    return int(metrics.get("tool_calls", 0))
+
+
+def _concise_final_reward(final_answer: str) -> float:
+    length = len(str(final_answer).strip())
+    if 1 <= length <= 80:
+        return 0.15
+    if length <= 160:
+        return 0.05
+    return -0.10
+
+
+def _compute_default_reward(metrics: Dict[str, Any]) -> Dict[str, Any]:
+    return {
         "format_reward": 0.3 if not metrics["malformed"] else -0.7,
         "tool_name_reward": 0.7 if metrics["tool_acc"] else -0.5,
         "args_reward": 0.6 if metrics["args_acc"] else -0.5,
@@ -302,7 +337,36 @@ def compute_total_reward(traj: ToolTrajectory, task: Dict[str, Any]) -> Tuple[fl
         "unfinished_penalty": -0.5 if metrics["unfinished"] else 0.0,
         "repetition_penalty": -rep_penalty(metrics.get("final_answer", "")),
     }
-    reward = sum(reward_info.values())
+
+
+def _compute_dense_v2_reward(metrics: Dict[str, Any], task: Dict[str, Any]) -> Dict[str, Any]:
+    expected_calls = _expected_tool_count(task, metrics)
+    tool_calls = int(metrics.get("tool_calls", 0))
+    extra_calls = max(int(metrics.get("extra_tool_calls", 0)), max(0, tool_calls - expected_calls))
+    step_efficiency = 0.25 if tool_calls == expected_calls else max(-0.25, -0.10 * abs(tool_calls - expected_calls))
+    return {
+        "format_reward": 0.20 if not metrics["malformed"] else -0.70,
+        "tool_name_reward": 0.35 if metrics["tool_acc"] else -0.70,
+        "args_reward": 0.40 if metrics["args_acc"] else -0.60,
+        "obs_use_reward": 0.35 if metrics.get("obs_use_strict_acc", metrics["obs_use_acc"]) else -0.35,
+        "final_answer_reward": 1.10 if metrics["answer_acc"] else -1.00,
+        "step_efficiency_reward": step_efficiency,
+        "concise_final_reward": _concise_final_reward(metrics.get("final_answer", "")),
+        "extra_tool_penalty": -0.20 * extra_calls,
+        "loop_penalty": -0.60 if metrics["loop"] else 0.0,
+        "overuse_penalty": -0.40 if "overuse_tool" in metrics["failures"] else 0.0,
+        "unnecessary_tool_penalty": -0.60 if "unnecessary_tool" in metrics["failures"] else 0.0,
+        "unfinished_penalty": -0.60 if metrics["unfinished"] else 0.0,
+        "repetition_penalty": -rep_penalty(metrics.get("final_answer", "")),
+    }
+
+
+def compute_total_reward(traj: ToolTrajectory, task: Dict[str, Any]) -> Tuple[float, Dict[str, Any]]:
+    metrics = evaluate_trajectory(traj, task)
+    profile = task.get("reward_profile") or "default"
+    reward_info = _compute_dense_v2_reward(metrics, task) if profile == "dense_v2" else _compute_default_reward(metrics)
+    reward_info["reward_profile"] = profile
+    reward = sum(value for value in reward_info.values() if isinstance(value, (int, float, bool)))
     reward = max(min(reward, 3.0), -3.0)
     reward_info.update(metrics)
     return reward, reward_info
@@ -317,6 +381,9 @@ def aggregate_reward_infos(reward_infos: List[Dict[str, Any]]) -> Dict[str, floa
         "args_reward",
         "obs_use_reward",
         "final_answer_reward",
+        "step_efficiency_reward",
+        "concise_final_reward",
+        "extra_tool_penalty",
         "loop_penalty",
         "overuse_penalty",
         "unnecessary_tool_penalty",
@@ -326,11 +393,13 @@ def aggregate_reward_infos(reward_infos: List[Dict[str, Any]]) -> Dict[str, floa
         "tool_acc",
         "args_acc",
         "obs_use_acc",
+        "obs_use_strict_acc",
         "answer_acc",
         "loop",
         "malformed",
         "unfinished",
         "tool_calls",
+        "extra_tool_calls",
     ]
     summary = {}
     for key in numeric_keys:
