@@ -5,6 +5,7 @@ set -euo pipefail
 # Start from the clean v13 SFT checkpoint, not from a probe/smoke checkpoint.
 
 EXP_NAME=${EXP_NAME:-v13_rl_stage1_$(date +%Y%m%d_%H%M%S)}
+STAGE_LABEL=${STAGE_LABEL:-stage1}
 
 CODE_ROOT=${CODE_ROOT:-/root/minimind}
 FS_ROOT=${FS_ROOT:-/root/autodl-fs/minimind}
@@ -36,8 +37,8 @@ RUN_DIR=$TMP_ROOT/runs/$EXP_NAME
 LOG_DIR=$RUN_DIR/logs
 REPORT_DIR=$CODE_ROOT/evals/reports/$SAVE_WEIGHT
 BASELINE_REPORT_DIR=$CODE_ROOT/evals/reports/$BASELINE_REPORT_WEIGHT
-TRACE_PATH=$REPORT_DIR/rl_stage1_rollout_trace.jsonl
-RL_DATASET=dataset/agent_rl_tooluse_minimind_math_normalized_${NORMALIZED_SEED_TAG}_stage1_${RL_ROWS}.jsonl
+TRACE_PATH=$REPORT_DIR/rl_${STAGE_LABEL}_rollout_trace.jsonl
+RL_DATASET=dataset/agent_rl_tooluse_minimind_math_normalized_${NORMALIZED_SEED_TAG}_${STAGE_LABEL}_${RL_ROWS}.jsonl
 
 mkdir -p "$LOG_DIR" "$REPORT_DIR"
 mkdir -p "$FS_ROOT/checkpoints" "$FS_ROOT/datasets" "$FS_ROOT/logs" "$FS_ROOT/reports" "$FS_ROOT/runs"
@@ -49,6 +50,38 @@ echo "==== [1] preflight: v13 source weight and baseline reports ===="
 test -f trainer/train_agent.py
 test -f evals/run_tool_eval.py
 test -f scripts/analyze_rollout_trace.py
+
+python - <<'PY'
+import sys
+
+try:
+    import numpy
+    import scipy
+    import sklearn
+    from transformers import AutoTokenizer  # noqa: F401
+except Exception as exc:
+    print("PYTHON_DEP_IMPORT_FAILED")
+    print(f"{type(exc).__name__}: {exc}")
+    print()
+    print("This is an AutoDL Python environment issue, usually a numpy/scipy/sklearn")
+    print("binary compatibility mismatch triggered while transformers imports sklearn.")
+    print("Fix it once in the container, then rerun this script:")
+    print()
+    print('  python -m pip install --no-cache-dir --force-reinstall "numpy==1.26.4" "scipy==1.12.0" "scikit-learn==1.5.1"')
+    print("  python - <<'PYCHK'")
+    print("  import numpy, scipy, sklearn")
+    print("  from transformers import AutoTokenizer")
+    print("  print('deps ok', numpy.__version__, scipy.__version__, sklearn.__version__)")
+    print("  PYCHK")
+    sys.exit(86)
+
+print(
+    "python deps OK:",
+    f"numpy={numpy.__version__}",
+    f"scipy={scipy.__version__}",
+    f"sklearn={sklearn.__version__}",
+)
+PY
 
 ensure_weight_in_out() {
   local weight_name="$1"
@@ -92,7 +125,7 @@ if [ ! -f "$NORMALIZED_RL_TRAIN" ]; then
   exit 2
 fi
 
-echo "==== [2] prepare stage1 RL dataset ===="
+echo "==== [2] prepare $STAGE_LABEL RL dataset ===="
 python - "$RL_ROWS" "$NORMALIZED_RL_TRAIN" "$RL_DATASET" <<'PY'
 import sys
 from pathlib import Path
@@ -114,7 +147,7 @@ PY
 
 rm -f "$TRACE_PATH"
 
-echo "==== [3] run stage1 RL from $FROM_WEIGHT ===="
+echo "==== [3] run $STAGE_LABEL RL from $FROM_WEIGHT ===="
 cd "$CODE_ROOT/trainer"
 OMP_NUM_THREADS=1 python train_agent.py \
   --rollout_engine torch \
@@ -146,15 +179,15 @@ OMP_NUM_THREADS=1 python train_agent.py \
   --num_workers 0 \
   --from_resume 0 \
   --use_compile 0 \
-  2>&1 | tee "$LOG_DIR/rl_stage1.log"
+  2>&1 | tee "$LOG_DIR/rl_${STAGE_LABEL}.log"
 cd "$CODE_ROOT"
 
 echo "==== [4] summarize rollout trace ===="
 python scripts/analyze_rollout_trace.py "$TRACE_PATH" \
-  --output "$REPORT_DIR/rl_stage1_trace_summary.json" \
-  2>&1 | tee "$LOG_DIR/rl_stage1_trace_summary.log"
+  --output "$REPORT_DIR/rl_${STAGE_LABEL}_trace_summary.json" \
+  2>&1 | tee "$LOG_DIR/rl_${STAGE_LABEL}_trace_summary.log"
 
-echo "==== [5] evaluate stage1 checkpoint ===="
+echo "==== [5] evaluate $STAGE_LABEL checkpoint ===="
 python evals/run_tool_eval.py \
   --weight "$SAVE_WEIGHT" \
   --mode guarded \
@@ -182,14 +215,15 @@ python evals/run_tool_eval.py \
   --output "$REPORT_DIR/minimind_math_normalized_guarded.json" \
   2>&1 | tee "$LOG_DIR/eval_minimind_math_normalized.log"
 
-echo "==== [6] compare stage1 against v13 baseline ===="
-python - "$BASELINE_REPORT_DIR" "$REPORT_DIR" <<'PY' | tee "$LOG_DIR/stage1_compare.log"
+echo "==== [6] compare $STAGE_LABEL against v13 baseline ===="
+python - "$BASELINE_REPORT_DIR" "$REPORT_DIR" "$STAGE_LABEL" <<'PY' | tee "$LOG_DIR/${STAGE_LABEL}_compare.log"
 import json
 import sys
 from pathlib import Path
 
 baseline_dir = Path(sys.argv[1])
 stage_dir = Path(sys.argv[2])
+stage_label = sys.argv[3]
 names = ["basic", "hard", "minimind_math_normalized"]
 metrics = ["valid_rate", "tool_acc", "args_acc", "answer_acc", "loop_rate", "malformed_rate", "unfinished_rate", "avg_reward"]
 
@@ -202,7 +236,7 @@ for name in names:
     for metric in metrics:
         b = float(baseline[name].get(metric, 0))
         s = float(stage[name].get(metric, 0))
-        print(f"{metric}: baseline={b:.4f} stage1={s:.4f} delta={s-b:+.4f}")
+        print(f"{metric}: baseline={b:.4f} {stage_label}={s:.4f} delta={s-b:+.4f}")
 
 checks = {
     "basic_reward": stage["basic"].get("avg_reward", 0) >= 2.95,
@@ -223,7 +257,7 @@ checks = {
 }
 passed = all(checks.values())
 print("=" * 80)
-print("STAGE1_PASS:", int(passed))
+print(f"{stage_label.upper()}_PASS:", int(passed))
 for key, ok in checks.items():
     print(f"{key}: {'PASS' if ok else 'FAIL'}")
 
@@ -231,12 +265,12 @@ verdict = {
     "passed": passed,
     "checks": checks,
     "next_step": (
-        "Run a wider stage2 RL with 512 rows from the original v13 SFT checkpoint."
+        "Consider the next wider RL stage from the original v13 SFT checkpoint."
         if passed
-        else "Do not continue RL. Inspect stage1 regressions and consider a smaller LR or harder filtered RL data."
+        else f"Do not continue RL. Inspect {stage_label} regressions and consider a smaller LR or harder filtered RL data."
     ),
 }
-(stage_dir / "stage1_verdict.json").write_text(json.dumps(verdict, ensure_ascii=False, indent=2), encoding="utf-8")
+(stage_dir / f"{stage_label}_verdict.json").write_text(json.dumps(verdict, ensure_ascii=False, indent=2), encoding="utf-8")
 PY
 
 echo "==== [7] backup artifacts ===="
@@ -253,4 +287,4 @@ echo "run dir: $RUN_DIR"
 echo "logs: $LOG_DIR"
 echo "reports: $REPORT_DIR"
 echo "trace: $TRACE_PATH"
-echo "stage1 checkpoint: $CODE_ROOT/out/${SAVE_WEIGHT}_${HIDDEN_SIZE}.pth"
+echo "$STAGE_LABEL checkpoint: $CODE_ROOT/out/${SAVE_WEIGHT}_${HIDDEN_SIZE}.pth"
